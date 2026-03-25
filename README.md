@@ -12,6 +12,21 @@ SwiftUI menu bar app for monitoring application bandwidth use.
 - Sparkline bandwidth graph (last 60 seconds)
 - Two-column popover panel from the menu bar
 
+## How measurement works
+
+Bandwidther uses macOS command-line networking tools rather than packet capture or private APIs.
+
+- Per-process bandwidth comes from `nettop` in per-process summary mode. The app runs `nettop` in delta mode, takes a baseline sample plus a 1-second follow-up sample, and uses that second sample as the current download/upload rate for each process.
+- The cumulative byte totals shown in the UI come from the baseline `nettop` sample. Those are process-level totals reported by `nettop`, not totals maintained independently by the app.
+- Connection summaries come from `lsof -iTCP -n -P`. The app parses active TCP sockets, attributes them to processes using `lsof` output, and classifies remote endpoints as internet or LAN/local using address heuristics.
+- Reverse DNS is done separately in the app using `getnameinfo`, so destination names are best-effort and may be missing even when the raw IP address is shown.
+
+Important limitations:
+
+- The connection view is a snapshot of currently visible TCP sockets. It is not a packet-level audit and it does not currently include UDP traffic in the summary panels.
+- LAN vs internet classification is heuristic. Private IPv4 ranges, loopback, link-local IPv6, and unique-local IPv6 are treated as local.
+- If `nettop` or `lsof` is unavailable or denied by the system, the app may be unable to collect some measurements. Recent versions of the app surface `nettop` failures in the UI instead of silently showing zero traffic.
+
 ## Building
 
 ```bash
