@@ -44,6 +44,18 @@ struct ConnectionSummary {
     var lanDestinations: [String] = []
 }
 
+struct NetworkEndpoint {
+    let host: String
+    let port: String
+
+    var displayString: String {
+        if host.contains(":") {
+            return "[\(host)]:\(port)"
+        }
+        return "\(host):\(port)"
+    }
+}
+
 // MARK: - Reverse DNS Cache
 
 class DNSCache: ObservableObject {
@@ -57,22 +69,35 @@ class DNSCache: ObservableObject {
         pending.insert(ip)
 
         queue.async { [weak self] in
-            var hints = addrinfo()
-            hints.ai_flags = AI_NUMERICHOST
-            hints.ai_family = AF_INET
-
-            var sa = sockaddr_in()
-            sa.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-            sa.sin_family = sa_family_t(AF_INET)
-            inet_pton(AF_INET, ip, &sa.sin_addr)
-
             var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            let result = withUnsafePointer(to: &sa) { saPtr in
-                saPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
-                    getnameinfo(sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size),
-                                &hostname, socklen_t(hostname.count),
-                                nil, 0, 0)
-                }
+            let result: Int32
+
+            if ip.contains(":") {
+                var sa = sockaddr_in6()
+                sa.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+                sa.sin6_family = sa_family_t(AF_INET6)
+                result = inet_pton(AF_INET6, ip, &sa.sin6_addr) == 1
+                    ? withUnsafePointer(to: &sa) { saPtr in
+                        saPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                            getnameinfo(sockPtr, socklen_t(MemoryLayout<sockaddr_in6>.size),
+                                        &hostname, socklen_t(hostname.count),
+                                        nil, 0, NI_NAMEREQD)
+                        }
+                    }
+                    : EAI_NONAME
+            } else {
+                var sa = sockaddr_in()
+                sa.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+                sa.sin_family = sa_family_t(AF_INET)
+                result = inet_pton(AF_INET, ip, &sa.sin_addr) == 1
+                    ? withUnsafePointer(to: &sa) { saPtr in
+                        saPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                            getnameinfo(sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size),
+                                        &hostname, socklen_t(hostname.count),
+                                        nil, 0, NI_NAMEREQD)
+                        }
+                    }
+                    : EAI_NONAME
             }
 
             let name: String?
@@ -336,8 +361,9 @@ class NetworkMonitor: ObservableObject {
                 // Trigger async DNS resolution for all unique IPs
                 let allDests = summary.internetDestinations + summary.lanDestinations
                 for dest in allDests {
-                    let ip = String(dest.prefix(while: { $0 != ":" }))
-                    self.dnsCache.resolve(ip)
+                    if let endpoint = self.parseDestinationString(dest) {
+                        self.dnsCache.resolve(endpoint.host)
+                    }
                 }
             }
         }
@@ -348,8 +374,8 @@ class NetworkMonitor: ObservableObject {
 
         let pipe = Pipe()
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/sbin/netstat")
-        process.arguments = ["-an", "-f", "inet"]
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = ["-n", "-P", "-iTCP"]
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
 
@@ -361,67 +387,70 @@ class NetworkMonitor: ObservableObject {
 
         for line in output.split(separator: "\n") {
             let cols = line.split(separator: " ", omittingEmptySubsequences: true)
-            guard cols.count >= 6 else { continue }
-            let state = String(cols.last ?? "")
+            guard cols.count >= 10 else { continue }
+            let stateToken = String(cols.last ?? "")
+            guard stateToken.hasPrefix("("), stateToken.hasSuffix(")") else { continue }
+
+            let state = String(stateToken.dropFirst().dropLast())
             guard state == "ESTABLISHED" || state == "SYN_SENT" || state == "CLOSE_WAIT" else { continue }
 
-            let foreign = String(cols[4])
-            guard let lastDot = foreign.lastIndex(of: ".") else { continue }
-            let ip = String(foreign[foreign.startIndex..<lastDot])
-            let port = String(foreign[foreign.index(after: lastDot)...])
+            let procName = String(cols[0])
+            guard let connField = cols.dropLast().last(where: { $0.contains("->") }) else { continue }
+            guard let remote = parseRemoteEndpoint(from: String(connField)) else { continue }
 
-            let isLocal = isPrivateIP(ip)
-            let dest = "\(ip):\(port)"
-
-            if isLocal {
+            if isLocalAddress(remote.host) {
                 summary.lanCount += 1
-                summary.lanDestinations.append(dest)
+                summary.lanDestinations.append(remote.displayString)
+                summary.lanProcesses[procName, default: 0] += 1
             } else {
                 summary.internetCount += 1
-                summary.internetDestinations.append(dest)
-            }
-        }
-
-        // Get process info via lsof
-        let pipe2 = Pipe()
-        let proc2 = Process()
-        proc2.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-        proc2.arguments = ["-i", "-n", "-P"]
-        proc2.standardOutput = pipe2
-        proc2.standardError = FileHandle.nullDevice
-
-        do { try proc2.run() } catch { return summary }
-        let data2 = pipe2.fileHandleForReading.readDataToEndOfFile()
-        proc2.waitUntilExit()
-
-        if let output2 = String(data: data2, encoding: .utf8) {
-            for line in output2.split(separator: "\n") {
-                guard line.contains("ESTABLISHED") else { continue }
-                let cols = line.split(separator: " ", omittingEmptySubsequences: true)
-                guard cols.count >= 9 else { continue }
-                let procName = String(cols[0])
-                let connStr = String(cols[8])
-                let parts = connStr.split(separator: ">")
-                guard parts.count == 2 else { continue }
-                let remote = String(parts[1])
-                guard let lastColon = remote.lastIndex(of: ":") else { continue }
-                let ip = String(remote[remote.startIndex..<lastColon])
-                if isPrivateIP(ip) {
-                    summary.lanProcesses[procName, default: 0] += 1
-                } else {
-                    summary.internetProcesses[procName, default: 0] += 1
-                }
+                summary.internetDestinations.append(remote.displayString)
+                summary.internetProcesses[procName, default: 0] += 1
             }
         }
 
         return summary
     }
 
-    private func isPrivateIP(_ ip: String) -> Bool {
-        if ip.hasPrefix("10.") || ip.hasPrefix("127.") || ip.hasPrefix("169.254.") { return true }
-        if ip.hasPrefix("192.168.") { return true }
-        if ip.hasPrefix("172.") {
-            let parts = ip.split(separator: ".")
+    private func parseRemoteEndpoint(from connection: String) -> NetworkEndpoint? {
+        let parts = connection.split(separator: ">", maxSplits: 1).map(String.init)
+        guard parts.count == 2 else { return nil }
+        return parseEndpoint(parts[1])
+    }
+
+    func parseDestinationString(_ destination: String) -> NetworkEndpoint? {
+        parseEndpoint(destination)
+    }
+
+    private func parseEndpoint(_ endpoint: String) -> NetworkEndpoint? {
+        let trimmed = endpoint.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("["),
+           let closeBracket = trimmed.firstIndex(of: "]"),
+           let colon = trimmed[closeBracket...].firstIndex(of: ":") {
+            let host = String(trimmed[trimmed.index(after: trimmed.startIndex)..<closeBracket])
+            let port = String(trimmed[trimmed.index(after: colon)...])
+            guard !host.isEmpty, !port.isEmpty else { return nil }
+            return NetworkEndpoint(host: host, port: port)
+        }
+
+        guard let colon = trimmed.lastIndex(of: ":") else { return nil }
+        let host = String(trimmed[..<colon])
+        let port = String(trimmed[trimmed.index(after: colon)...])
+        guard !host.isEmpty, !port.isEmpty else { return nil }
+        return NetworkEndpoint(host: host, port: port)
+    }
+
+    private func isLocalAddress(_ host: String) -> Bool {
+        if host == "localhost" || host == "::1" { return true }
+        if host.hasPrefix("fe80:") || host.hasPrefix("FE80:") { return true }
+        if host.hasPrefix("fc") || host.hasPrefix("FC") || host.hasPrefix("fd") || host.hasPrefix("FD") {
+            return true
+        }
+
+        if host.hasPrefix("10.") || host.hasPrefix("127.") || host.hasPrefix("169.254.") { return true }
+        if host.hasPrefix("192.168.") { return true }
+        if host.hasPrefix("172.") {
+            let parts = host.split(separator: ".")
             if parts.count >= 2, let second = Int(parts[1]), (16...31).contains(second) { return true }
         }
         return false
@@ -879,18 +908,23 @@ struct ContentView: View {
                 } else {
                     LazyVStack(alignment: .leading, spacing: 4) {
                         ForEach(Array(dests), id: \.self) { dest in
-                            let ip = String(dest.prefix(while: { $0 != ":" }))
-                            let port = String(dest.drop(while: { $0 != ":" }).dropFirst())
-                            let hostname = monitor.dnsCache.hostname(for: ip)
-                            VStack(alignment: .leading, spacing: 1) {
-                                if let hostname = hostname {
-                                    Text("\(hostname):\(port)")
-                                        .font(.system(size: 12, weight: .medium))
-                                        .foregroundColor(.primary)
+                            if let endpoint = monitor.parseDestinationString(dest) {
+                                let hostname = monitor.dnsCache.hostname(for: endpoint.host)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    if let hostname = hostname {
+                                        Text("\(hostname):\(endpoint.port)")
+                                            .font(.system(size: 12, weight: .medium))
+                                            .foregroundColor(.primary)
+                                            .lineLimit(1)
+                                    }
+                                    Text(dest)
+                                        .font(.system(size: hostname != nil ? 10 : 11, design: .monospaced))
+                                        .foregroundColor(.secondary)
                                         .lineLimit(1)
                                 }
+                            } else {
                                 Text(dest)
-                                    .font(.system(size: hostname != nil ? 10 : 11, design: .monospaced))
+                                    .font(.system(size: 11, design: .monospaced))
                                     .foregroundColor(.secondary)
                                     .lineLimit(1)
                             }
