@@ -115,6 +115,7 @@ struct NettopResult {
     var totals: [String: NettopProcessData] = [:]
     // Delta rates per second (from second sample)
     var deltas: [String: NettopProcessData] = [:]
+    var errorMessage: String?
 }
 
 private func parseNettopCSVBlock(_ lines: [String]) -> [String: NettopProcessData] {
@@ -154,19 +155,33 @@ private func parseNettopCSVBlock(_ lines: [String]) -> [String: NettopProcessDat
 
 func runNettop() -> NettopResult {
     let pipe = Pipe()
+    let errorPipe = Pipe()
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/usr/bin/nettop")
-    // -P: per-process summary, -L 2: two samples (first=cumulative, second=delta),
+    // -d: delta mode, -P: per-process summary, -L 2: baseline sample then one delta,
     // -s 1: 1 second interval, -x: raw numbers, -n: no DNS, -J: only these columns
-    proc.arguments = ["-P", "-L", "2", "-s", "1", "-x", "-n", "-J", "bytes_in,bytes_out"]
+    proc.arguments = ["-d", "-P", "-L", "2", "-s", "1", "-x", "-n", "-J", "bytes_in,bytes_out"]
     proc.standardOutput = pipe
-    proc.standardError = FileHandle.nullDevice
+    proc.standardError = errorPipe
 
-    do { try proc.run() } catch { return NettopResult() }
+    do { try proc.run() } catch {
+        return NettopResult(errorMessage: "Failed to start nettop: \(error.localizedDescription)")
+    }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
     proc.waitUntilExit()
 
-    guard let output = String(data: data, encoding: .utf8) else { return NettopResult() }
+    let stderr = String(data: errorData, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard proc.terminationStatus == 0 else {
+        let detail = stderr.isEmpty ? "nettop exited with status \(proc.terminationStatus)" : stderr
+        return NettopResult(errorMessage: detail)
+    }
+
+    guard let output = String(data: data, encoding: .utf8), !output.isEmpty else {
+        let detail = stderr.isEmpty ? "nettop returned no output" : stderr
+        return NettopResult(errorMessage: detail)
+    }
 
     // Split into two blocks at the second header line
     let allLines = output.split(separator: "\n", omittingEmptySubsequences: false).map { String($0) }
@@ -183,6 +198,10 @@ func runNettop() -> NettopResult {
     }
     if !current.isEmpty { blocks.append(current) }
 
+    guard blocks.count >= 2 else {
+        return NettopResult(errorMessage: "nettop did not return a baseline and delta sample")
+    }
+
     var result = NettopResult()
     if blocks.count >= 1 { result.totals = parseNettopCSVBlock(blocks[0]) }
     if blocks.count >= 2 { result.deltas = parseNettopCSVBlock(blocks[1]) }
@@ -195,6 +214,7 @@ class NetworkMonitor: ObservableObject {
     @Published var currentRate = BandwidthRate.zero
     @Published var totalBytesIn: UInt64 = 0
     @Published var totalBytesOut: UInt64 = 0
+    @Published var nettopStatus: String?
     @Published var connectionSummary = ConnectionSummary()
     @Published var dnsCache = DNSCache()
     @Published var rateHistory: [BandwidthRate] = []
@@ -232,6 +252,11 @@ class NetworkMonitor: ObservableObject {
     }
 
     private func processNettopResult(_ result: NettopResult) {
+        if let errorMessage = result.errorMessage {
+            nettopStatus = errorMessage
+            return
+        }
+
         var procs: [ProcessBandwidth] = []
         var sumRateIn: Double = 0
         var sumRateOut: Double = 0
@@ -272,6 +297,7 @@ class NetworkMonitor: ObservableObject {
         currentRate = rate
         totalBytesIn = sumTotalIn
         totalBytesOut = sumTotalOut
+        nettopStatus = nil
         rateHistory.append(rate)
         if rateHistory.count > maxHistory {
             rateHistory.removeFirst()
@@ -689,9 +715,16 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Bandwidther")
                         .font(.system(size: 20, weight: .bold))
-                    Text("All interfaces (via nettop)")
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary)
+                    if let status = monitor.nettopStatus {
+                        Text("Nettop unavailable: \(status)")
+                            .font(.system(size: 11))
+                            .foregroundColor(.red)
+                            .lineLimit(2)
+                    } else {
+                        Text("All interfaces (via nettop delta mode)")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                    }
                 }
                 Spacer()
                 VStack(alignment: .trailing, spacing: 2) {
