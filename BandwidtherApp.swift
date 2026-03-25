@@ -4,15 +4,6 @@ import Foundation
 
 // MARK: - Data Models
 
-struct InterfaceSnapshot {
-    let name: String
-    let bytesIn: UInt64
-    let bytesOut: UInt64
-    let packetsIn: UInt64
-    let packetsOut: UInt64
-    let timestamp: Date
-}
-
 struct BandwidthRate {
     let bytesInPerSec: Double
     let bytesOutPerSec: Double
@@ -22,13 +13,25 @@ struct BandwidthRate {
     static let zero = BandwidthRate(bytesInPerSec: 0, bytesOutPerSec: 0)
 }
 
-struct ConnectionInfo: Identifiable {
-    let id = UUID()
-    let process: String
-    let remoteIP: String
-    let remotePort: String
-    let isLocal: Bool
-    let state: String
+struct ProcessBandwidth: Identifiable {
+    let id: String  // process name
+    let name: String
+    let bytesInPerSec: Double
+    let bytesOutPerSec: Double
+    let totalBytesIn: UInt64
+    let totalBytesOut: UInt64
+    let connections: Int
+
+    var totalPerSec: Double { bytesInPerSec + bytesOutPerSec }
+    var totalBytes: UInt64 { totalBytesIn + totalBytesOut }
+}
+
+enum ProcessSortKey: String, CaseIterable {
+    case totalRate = "Rate"
+    case download = "Down"
+    case upload = "Up"
+    case totalBytes = "Total"
+    case name = "Name"
 }
 
 struct ConnectionSummary {
@@ -38,10 +41,151 @@ struct ConnectionSummary {
     var lanProcesses: [String: Int] = [:]
     var internetDestinations: [String] = []
     var lanDestinations: [String] = []
-    var internetBytesIn: Double = 0
-    var internetBytesOut: Double = 0
-    var lanBytesIn: Double = 0
-    var lanBytesOut: Double = 0
+}
+
+// MARK: - Reverse DNS Cache
+
+class DNSCache: ObservableObject {
+    @Published var resolved: [String: String] = [:]  // ip -> hostname
+    private var pending: Set<String> = []
+    private let queue = DispatchQueue(label: "dns-resolver", attributes: .concurrent)
+
+    func resolve(_ ip: String) {
+        // Already resolved or in-flight
+        if resolved[ip] != nil || pending.contains(ip) { return }
+        pending.insert(ip)
+
+        queue.async { [weak self] in
+            var hints = addrinfo()
+            hints.ai_flags = AI_NUMERICHOST
+            hints.ai_family = AF_INET
+
+            var sa = sockaddr_in()
+            sa.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            sa.sin_family = sa_family_t(AF_INET)
+            inet_pton(AF_INET, ip, &sa.sin_addr)
+
+            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let result = withUnsafePointer(to: &sa) { saPtr in
+                saPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                    getnameinfo(sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size),
+                                &hostname, socklen_t(hostname.count),
+                                nil, 0, 0)
+                }
+            }
+
+            let name: String?
+            if result == 0 {
+                let resolved = String(cString: hostname)
+                // getnameinfo returns the IP back if it can't resolve — skip those
+                name = (resolved != ip) ? resolved : nil
+            } else {
+                name = nil
+            }
+
+            DispatchQueue.main.async {
+                self?.pending.remove(ip)
+                if let name = name {
+                    self?.resolved[ip] = name
+                } else {
+                    // Store empty string so we don't retry
+                    self?.resolved[ip] = ""
+                }
+            }
+        }
+    }
+
+    func hostname(for ip: String) -> String? {
+        if let name = resolved[ip], !name.isEmpty { return name }
+        return nil
+    }
+}
+
+// MARK: - Nettop Parser
+
+struct NettopProcessData {
+    var bytesIn: UInt64 = 0
+    var bytesOut: UInt64 = 0
+    var pids: Set<String> = []
+}
+
+struct NettopResult {
+    // Cumulative totals (from first sample)
+    var totals: [String: NettopProcessData] = [:]
+    // Delta rates per second (from second sample)
+    var deltas: [String: NettopProcessData] = [:]
+}
+
+private func parseNettopCSVBlock(_ lines: [String]) -> [String: NettopProcessData] {
+    var result: [String: NettopProcessData] = [:]
+    for line in lines {
+        let cols = line.split(separator: ",", omittingEmptySubsequences: false).map {
+            String($0).trimmingCharacters(in: .whitespaces)
+        }
+        // Expect: name.pid, bytes_in, bytes_out, (trailing comma)
+        guard cols.count >= 3 else { continue }
+        let nameField = cols[0]
+        if nameField.isEmpty || nameField.hasPrefix("time") { continue }
+
+        guard let bytesIn = UInt64(cols[1]), let bytesOut = UInt64(cols[2]) else { continue }
+
+        // Extract process name and PID from "ProcessName.12345"
+        var procName = nameField
+        var pid = ""
+        if let dotRange = nameField.range(of: ".", options: .backwards) {
+            let suffix = String(nameField[dotRange.upperBound...])
+            if Int(suffix) != nil {
+                procName = String(nameField[nameField.startIndex..<dotRange.lowerBound])
+                pid = suffix
+            }
+        }
+        // Handle names with spaces like "LM Studio.1234"
+        if procName.isEmpty { continue }
+
+        var existing = result[procName] ?? NettopProcessData()
+        existing.bytesIn += bytesIn
+        existing.bytesOut += bytesOut
+        if !pid.isEmpty { existing.pids.insert(pid) }
+        result[procName] = existing
+    }
+    return result
+}
+
+func runNettop() -> NettopResult {
+    let pipe = Pipe()
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/nettop")
+    // -P: per-process summary, -L 2: two samples (first=cumulative, second=delta),
+    // -s 1: 1 second interval, -x: raw numbers, -n: no DNS, -J: only these columns
+    proc.arguments = ["-P", "-L", "2", "-s", "1", "-x", "-n", "-J", "bytes_in,bytes_out"]
+    proc.standardOutput = pipe
+    proc.standardError = FileHandle.nullDevice
+
+    do { try proc.run() } catch { return NettopResult() }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    proc.waitUntilExit()
+
+    guard let output = String(data: data, encoding: .utf8) else { return NettopResult() }
+
+    // Split into two blocks at the second header line
+    let allLines = output.split(separator: "\n", omittingEmptySubsequences: false).map { String($0) }
+
+    var blocks: [[String]] = []
+    var current: [String] = []
+    for line in allLines {
+        if line.hasPrefix(",bytes_in") {
+            if !current.isEmpty { blocks.append(current) }
+            current = []
+        } else {
+            current.append(line)
+        }
+    }
+    if !current.isEmpty { blocks.append(current) }
+
+    var result = NettopResult()
+    if blocks.count >= 1 { result.totals = parseNettopCSVBlock(blocks[0]) }
+    if blocks.count >= 2 { result.deltas = parseNettopCSVBlock(blocks[1]) }
+    return result
 }
 
 // MARK: - Network Monitor
@@ -51,86 +195,125 @@ class NetworkMonitor: ObservableObject {
     @Published var totalBytesIn: UInt64 = 0
     @Published var totalBytesOut: UInt64 = 0
     @Published var connectionSummary = ConnectionSummary()
-    @Published var primaryInterface: String = "en0"
+    @Published var dnsCache = DNSCache()
     @Published var rateHistory: [BandwidthRate] = []
+    @Published var processBandwidths: [ProcessBandwidth] = []
+    @Published var processSortKey: ProcessSortKey = .totalRate
+    @Published var processSortAscending: Bool = false
 
-    private var previousSnapshot: InterfaceSnapshot?
-    private var rateTimer: Timer?
     private var connTimer: Timer?
+    private var nettopTimer: Timer?
     private let maxHistory = 60
 
     init() {
-        refreshInterfaceStats()
         refreshConnections()
-        rateTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.refreshInterfaceStats()
-        }
         connTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             self?.refreshConnections()
+        }
+        refreshNettop()
+        nettopTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            self?.refreshNettop()
         }
     }
 
     deinit {
-        rateTimer?.invalidate()
         connTimer?.invalidate()
+        nettopTimer?.invalidate()
     }
 
-    func refreshInterfaceStats() {
-        guard let snapshot = getInterfaceStats(name: primaryInterface) else { return }
-
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.totalBytesIn = snapshot.bytesIn
-            self.totalBytesOut = snapshot.bytesOut
-
-            if let prev = self.previousSnapshot {
-                let dt = snapshot.timestamp.timeIntervalSince(prev.timestamp)
-                if dt > 0 {
-                    let rate = BandwidthRate(
-                        bytesInPerSec: Double(snapshot.bytesIn - prev.bytesIn) / dt,
-                        bytesOutPerSec: Double(snapshot.bytesOut - prev.bytesOut) / dt
-                    )
-                    self.currentRate = rate
-                    self.rateHistory.append(rate)
-                    if self.rateHistory.count > self.maxHistory {
-                        self.rateHistory.removeFirst()
-                    }
-                }
+    func refreshNettop() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = runNettop()
+            DispatchQueue.main.async {
+                self?.processNettopResult(result)
             }
-            self.previousSnapshot = snapshot
         }
+    }
+
+    private func processNettopResult(_ result: NettopResult) {
+        var procs: [ProcessBandwidth] = []
+        var sumRateIn: Double = 0
+        var sumRateOut: Double = 0
+        var sumTotalIn: UInt64 = 0
+        var sumTotalOut: UInt64 = 0
+
+        let allNames = Set(result.totals.keys).union(result.deltas.keys)
+
+        for name in allNames {
+            let total = result.totals[name]
+            let delta = result.deltas[name]
+
+            let rateIn = Double(delta?.bytesIn ?? 0)
+            let rateOut = Double(delta?.bytesOut ?? 0)
+            let totalIn = total?.bytesIn ?? 0
+            let totalOut = total?.bytesOut ?? 0
+            let pidCount = max(total?.pids.count ?? 0, delta?.pids.count ?? 0)
+
+            sumRateIn += rateIn
+            sumRateOut += rateOut
+            sumTotalIn += totalIn
+            sumTotalOut += totalOut
+
+            if totalIn > 0 || totalOut > 0 {
+                procs.append(ProcessBandwidth(
+                    id: name,
+                    name: name,
+                    bytesInPerSec: rateIn,
+                    bytesOutPerSec: rateOut,
+                    totalBytesIn: totalIn,
+                    totalBytesOut: totalOut,
+                    connections: pidCount
+                ))
+            }
+        }
+
+        let rate = BandwidthRate(bytesInPerSec: sumRateIn, bytesOutPerSec: sumRateOut)
+        currentRate = rate
+        totalBytesIn = sumTotalIn
+        totalBytesOut = sumTotalOut
+        rateHistory.append(rate)
+        if rateHistory.count > maxHistory {
+            rateHistory.removeFirst()
+        }
+
+        processBandwidths = sortProcesses(procs)
+    }
+
+    func sortProcesses(_ procs: [ProcessBandwidth]) -> [ProcessBandwidth] {
+        let sorted: [ProcessBandwidth]
+        switch processSortKey {
+        case .totalRate:
+            sorted = procs.sorted { $0.totalPerSec > $1.totalPerSec }
+        case .download:
+            sorted = procs.sorted { $0.bytesInPerSec > $1.bytesInPerSec }
+        case .upload:
+            sorted = procs.sorted { $0.bytesOutPerSec > $1.bytesOutPerSec }
+        case .totalBytes:
+            sorted = procs.sorted { $0.totalBytes > $1.totalBytes }
+        case .name:
+            sorted = procs.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        }
+        return processSortAscending ? sorted.reversed() : sorted
+    }
+
+    func resortProcesses() {
+        processBandwidths = sortProcesses(processBandwidths)
     }
 
     func refreshConnections() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let summary = self?.parseConnections() ?? ConnectionSummary()
             DispatchQueue.main.async {
-                self?.connectionSummary = summary
+                guard let self = self else { return }
+                self.connectionSummary = summary
+                // Trigger async DNS resolution for all unique IPs
+                let allDests = summary.internetDestinations + summary.lanDestinations
+                for dest in allDests {
+                    let ip = String(dest.prefix(while: { $0 != ":" }))
+                    self.dnsCache.resolve(ip)
+                }
             }
         }
-    }
-
-    private func getInterfaceStats(name: String) -> InterfaceSnapshot? {
-        var ifaddr: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return nil }
-        defer { freeifaddrs(ifaddr) }
-
-        for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
-            let ifaName = String(cString: ptr.pointee.ifa_name)
-            guard ifaName == name else { continue }
-            guard ptr.pointee.ifa_addr.pointee.sa_family == UInt8(AF_LINK) else { continue }
-
-            let data = unsafeBitCast(ptr.pointee.ifa_data, to: UnsafeMutablePointer<if_data>.self)
-            return InterfaceSnapshot(
-                name: ifaName,
-                bytesIn: UInt64(data.pointee.ifi_ibytes),
-                bytesOut: UInt64(data.pointee.ifi_obytes),
-                packetsIn: UInt64(data.pointee.ifi_ipackets),
-                packetsOut: UInt64(data.pointee.ifi_opackets),
-                timestamp: Date()
-            )
-        }
-        return nil
     }
 
     private func parseConnections() -> ConnectionSummary {
@@ -337,6 +520,108 @@ struct ProcessRow: View {
     }
 }
 
+struct BarView: View {
+    let fraction: Double
+    let color: Color
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(color.opacity(0.1))
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(color.opacity(0.5))
+                    .frame(width: max(0, geo.size.width * CGFloat(min(fraction, 1.0))))
+            }
+        }
+        .frame(height: 4)
+    }
+}
+
+struct SortButton: View {
+    let label: String
+    let key: ProcessSortKey
+    @Binding var currentKey: ProcessSortKey
+    @Binding var ascending: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: {
+            if currentKey == key {
+                ascending.toggle()
+            } else {
+                currentKey = key
+                ascending = key == .name ? false : false
+            }
+            action()
+        }) {
+            HStack(spacing: 2) {
+                Text(label)
+                    .font(.system(size: 10, weight: currentKey == key ? .bold : .medium))
+                if currentKey == key {
+                    Image(systemName: ascending ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 8))
+                }
+            }
+            .foregroundColor(currentKey == key ? .primary : .secondary)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct ProcessBandwidthRow: View {
+    let proc: ProcessBandwidth
+    let maxRate: Double
+
+    var body: some View {
+        VStack(spacing: 4) {
+            HStack {
+                Text(proc.name)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .lineLimit(1)
+                Spacer()
+                Text(formatBytesRate(proc.totalPerSec))
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .foregroundColor(proc.totalPerSec > 0 ? .primary : .secondary)
+            }
+            HStack(spacing: 12) {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.down")
+                        .font(.system(size: 8))
+                        .foregroundColor(.blue)
+                    Text(formatBytesRate(proc.bytesInPerSec))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.blue)
+                }
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 8))
+                        .foregroundColor(.orange)
+                    Text(formatBytesRate(proc.bytesOutPerSec))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.orange)
+                }
+                Spacer()
+                if proc.connections > 1 {
+                    Text("\(proc.connections) pids")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
+                Text(formatTotalBytes(proc.totalBytes))
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
+            }
+            if maxRate > 0 {
+                HStack(spacing: 2) {
+                    BarView(fraction: proc.bytesInPerSec / maxRate, color: .blue)
+                    BarView(fraction: proc.bytesOutPerSec / maxRate, color: .orange)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}
+
 struct ContentView: View {
     @StateObject private var monitor = NetworkMonitor()
 
@@ -348,7 +633,7 @@ struct ContentView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Bandwidther")
                             .font(.system(size: 20, weight: .bold))
-                        Text("Interface: \(monitor.primaryInterface)")
+                        Text("All interfaces (via nettop)")
                             .font(.system(size: 11))
                             .foregroundColor(.secondary)
                     }
@@ -425,9 +710,63 @@ struct ContentView: View {
                     .cornerRadius(8)
                 }
 
+                // Per-Process Bandwidth
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        SectionHeader(title: "Per-Process Bandwidth", icon: "cpu")
+                        Spacer()
+                        Text("\(monitor.processBandwidths.count) processes")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    }
+
+                    // Sort controls
+                    HStack(spacing: 12) {
+                        Text("Sort:")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                        ForEach(ProcessSortKey.allCases, id: \.self) { key in
+                            SortButton(
+                                label: key.rawValue,
+                                key: key,
+                                currentKey: $monitor.processSortKey,
+                                ascending: $monitor.processSortAscending,
+                                action: { monitor.resortProcesses() }
+                            )
+                        }
+                    }
+
+                    let maxRate = monitor.processBandwidths.map { $0.totalPerSec }.max() ?? 1.0
+
+                    if monitor.processBandwidths.isEmpty {
+                        HStack {
+                            Spacer()
+                            VStack(spacing: 4) {
+                                ProgressView()
+                                    .scaleEffect(0.7)
+                                Text("Sampling network traffic...")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.secondary)
+                            }
+                            .padding(.vertical, 20)
+                            Spacer()
+                        }
+                    } else {
+                        LazyVStack(spacing: 0) {
+                            ForEach(monitor.processBandwidths) { proc in
+                                ProcessBandwidthRow(proc: proc, maxRate: maxRate)
+                                Divider()
+                            }
+                        }
+                    }
+                }
+                .padding(10)
+                .background(Color.primary.opacity(0.03))
+                .cornerRadius(8)
+
                 // Totals since boot
                 VStack(alignment: .leading, spacing: 6) {
-                    SectionHeader(title: "Total Since Boot", icon: "clock.arrow.circlepath")
+                    SectionHeader(title: "Cumulative Total", icon: "clock.arrow.circlepath")
                     HStack {
                         HStack(spacing: 4) {
                             Image(systemName: "arrow.down")
@@ -503,12 +842,23 @@ struct ContentView: View {
                             .font(.system(size: 11))
                             .foregroundColor(.secondary)
                     } else {
-                        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], alignment: .leading, spacing: 3) {
+                        LazyVStack(alignment: .leading, spacing: 4) {
                             ForEach(Array(dests), id: \.self) { dest in
-                                Text(dest)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundColor(.secondary)
-                                    .lineLimit(1)
+                                let ip = String(dest.prefix(while: { $0 != ":" }))
+                                let port = String(dest.drop(while: { $0 != ":" }).dropFirst())
+                                let hostname = monitor.dnsCache.hostname(for: ip)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    if let hostname = hostname {
+                                        Text("\(hostname):\(port)")
+                                            .font(.system(size: 12, weight: .medium))
+                                            .foregroundColor(.primary)
+                                            .lineLimit(1)
+                                    }
+                                    Text(dest)
+                                        .font(.system(size: hostname != nil ? 10 : 11, design: .monospaced))
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
+                                }
                             }
                         }
                     }
@@ -519,7 +869,7 @@ struct ContentView: View {
             }
             .padding(16)
         }
-        .frame(width: 480, height: 680)
+        .frame(width: 520, height: 800)
     }
 }
 
