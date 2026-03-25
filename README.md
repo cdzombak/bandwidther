@@ -2,6 +2,9 @@
 
 SwiftUI menu bar app for monitoring application bandwidth use.
 
+> [!NOTE]
+> This app was vibe coded using Claude Opus 4.6 and GPT-5.4. I do not have deep knowledge of macOS networking or SwiftUI such that I can confidently evaluate the end result.
+
 ![Screenshot](https://github.com/simonw/bandwidther/raw/main/screenshot.png)
 
 ## Features
