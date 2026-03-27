@@ -5,7 +5,7 @@ SwiftUI menu bar app for monitoring application bandwidth use.
 > [!NOTE]
 > This app was vibe coded using Claude Opus 4.6 and GPT-5.4. I do not have deep knowledge of macOS networking or SwiftUI such that I can confidently evaluate the end result.
 
-![Screenshot](https://github.com/simonw/bandwidther/raw/main/screenshot.png)
+![Screenshot of Bandwidther macOS app showing two columns: left side displays overall download/upload speeds, a bandwidth graph over the last 60 seconds, cumulative totals, internet and LAN connection counts, and internet destinations; right side shows per-process bandwidth usage sorted by rate with processes like nsurlsessiond, apsd, rapportd, mDNSResponder, Dropbox, and others listed with their individual download/upload speeds and progress bars.](https://github.com/simonw/bandwidther/raw/main/screenshot.png)
 
 ## Features
 
