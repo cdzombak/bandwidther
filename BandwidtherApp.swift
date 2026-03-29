@@ -462,9 +462,9 @@ class NetworkMonitor: ObservableObject {
 // MARK: - Formatting Helpers
 
 func formatBytes(_ bytes: Double) -> String {
-    if bytes >= 1_073_741_824 { return String(format: "%.2f GB", bytes / 1_073_741_824) }
-    if bytes >= 1_048_576 { return String(format: "%.1f MB", bytes / 1_048_576) }
-    if bytes >= 1024 { return String(format: "%.1f KB", bytes / 1024) }
+    if bytes >= 1_073_741_824 { return String(format: "%.2f GiB", bytes / 1_073_741_824) }
+    if bytes >= 1_048_576 { return String(format: "%.1f MiB", bytes / 1_048_576) }
+    if bytes >= 1024 { return String(format: "%.1f KiB", bytes / 1024) }
     return String(format: "%.0f B", bytes)
 }
 
