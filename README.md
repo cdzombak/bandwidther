@@ -35,8 +35,10 @@ Important limitations:
 ```bash
 git clone https://github.com/simonw/bandwidther
 cd bandwidther
-swiftc -parse-as-library -framework SwiftUI -framework AppKit -o Bandwidther BandwidtherApp.swift
-./Bandwidther
+make
+open Bandwidther.app
 ```
 
 Requires macOS and Xcode command line tools (`xcode-select --install`).
+
+The `Makefile` compiles the Swift source and packages it into a proper `.app` bundle with `LSUIElement` set so it runs as a menu bar agent (no Dock icon).
