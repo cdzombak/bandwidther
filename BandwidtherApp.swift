@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 import Darwin
 import Foundation
 
@@ -236,6 +237,7 @@ func runNettop() -> NettopResult {
 // MARK: - Network Monitor
 
 class NetworkMonitor: ObservableObject {
+    static let shared = NetworkMonitor()
     @Published var currentRate = BandwidthRate.zero
     @Published var totalBytesIn: UInt64 = 0
     @Published var totalBytesOut: UInt64 = 0
@@ -679,7 +681,7 @@ struct ProcessBandwidthRow: View {
 }
 
 struct ContentView: View {
-    @StateObject private var monitor = NetworkMonitor()
+    @StateObject private var monitor = NetworkMonitor.shared
 
     // MARK: - Left column: Per-Process Bandwidth
     var leftColumn: some View {
@@ -1010,20 +1012,77 @@ struct MenuBarIconView: View {
     }
 }
 
+// MARK: - Menu Bar Speed Icon
+
+final class MenuBarIconGenerator {
+    static func generateIcon(text: String) -> NSImage {
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium)
+        let image = NSImage(size: NSSize(width: 66, height: 22), flipped: false) { rect in
+            let style = NSMutableParagraphStyle()
+            style.alignment = .right
+            style.maximumLineHeight = 10
+
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .paragraphStyle: style,
+            ]
+
+            let textSize = text.size(withAttributes: attributes)
+            let textRect = NSRect(
+                x: 0,
+                y: (rect.height - textSize.height) / 2 - 1.5,
+                width: 66,
+                height: textSize.height
+            )
+
+            text.draw(in: textRect, withAttributes: attributes)
+            return true
+        }
+
+        image.isTemplate = true
+        return image
+    }
+
+    static func formatCompactRate(_ bytesPerSec: Double) -> String {
+        if bytesPerSec >= 1_073_741_824 { return String(format: "%4.0f GiB", bytesPerSec / 1_073_741_824) }
+        if bytesPerSec >= 1_048_576 { return String(format: "%4.0f MiB", bytesPerSec / 1_048_576) }
+        if bytesPerSec >= 1024 { return String(format: "%4.0f KiB", bytesPerSec / 1024) }
+        return String(format: "%4.0f   B", bytesPerSec)
+    }
+
+    static func menuBarText(rate: BandwidthRate) -> String {
+        let up = formatCompactRate(rate.bytesOutPerSec)
+        let down = formatCompactRate(rate.bytesInPerSec)
+        return "\(up)/s ↑\n\(down)/s ↓"
+    }
+}
+
 // MARK: - App Delegate for Menu Bar
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var popover: NSPopover!
+    private var rateObservation: AnyCancellable?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Create status bar item first, before changing activation policy
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        let monitor = NetworkMonitor.shared
+
+        // Create status bar item with variable width for speed text
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "arrow.up.arrow.down", accessibilityDescription: "Bandwidther")
+            button.image = MenuBarIconGenerator.generateIcon(
+                text: MenuBarIconGenerator.menuBarText(rate: .zero)
+            )
             button.action = #selector(togglePopover)
             button.target = self
+        }
+
+        // Observe rate changes and update the menu bar icon
+        rateObservation = monitor.$currentRate.receive(on: RunLoop.main).sink { [weak self] rate in
+            self?.statusItem.button?.image = MenuBarIconGenerator.generateIcon(
+                text: MenuBarIconGenerator.menuBarText(rate: rate)
+            )
         }
 
         // Create the popover with our content
