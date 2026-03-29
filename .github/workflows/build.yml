@@ -1,0 +1,22 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make
+      - name: Create DMG
+        run: |
+          mkdir -p dmg-stage
+          cp -R Bandwidther.app dmg-stage/
+          ln -s /Applications dmg-stage/Applications
+          hdiutil create -volname Bandwidther -srcfolder dmg-stage -ov -format UDZO Bandwidther.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Bandwidther.dmg
+          path: Bandwidther.dmg
