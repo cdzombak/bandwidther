@@ -3,13 +3,40 @@ name: Build
 on:
   push:
     branches: [main]
+    tags: ["v*"]
 
 jobs:
   build:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check Info.plist version matches tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          plist_version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Info.plist)
+          if [ "$plist_version" != "$tag_version" ]; then
+            echo "::error::Info.plist version ($plist_version) does not match tag ($tag_version)"
+            exit 1
+          fi
+          echo "Version check passed: $plist_version"
       - run: make
+      - name: Codesign app
+        env:
+          DEVID_SIGNING_CERT_BASE64: ${{ secrets.DEVID_SIGNING_CERT }}
+          DEVID_SIGNING_CERT_PASS: ${{ secrets.DEVID_SIGNING_CERT_PASS }}
+          DEVID_SIGNING_CERT_ID: ${{ secrets.DEVID_SIGNING_CERT_ID }}
+          KEYCHAIN_PASS: ${{ secrets.KEYCHAIN_PASS }}
+        run: |
+          security create-keychain -p "$KEYCHAIN_PASS" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASS" build.keychain
+          echo "$DEVID_SIGNING_CERT_BASE64" | base64 --decode > certificate.p12
+          security import certificate.p12 -k build.keychain -P "$DEVID_SIGNING_CERT_PASS" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" build.keychain
+          /usr/bin/codesign --force --timestamp --options=runtime -s "$DEVID_SIGNING_CERT_ID" Bandwidther.app -v
+      - name: Verify code signature
+        run: codesign -dv --verbose=4 Bandwidther.app
       - name: Create DMG
         run: |
           mkdir -p dmg-stage
@@ -20,3 +47,70 @@ jobs:
         with:
           name: Bandwidther.dmg
           path: Bandwidther.dmg
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Bandwidther.dmg
+      - name: Notarize DMG
+        env:
+          NOTARIZATION_APPLE_ID: ${{ secrets.NOTARIZATION_APPLE_ID }}
+          NOTARIZATION_TEAM_ID: ${{ secrets.NOTARIZATION_TEAM_ID }}
+          NOTARIZATION_PASS: ${{ secrets.NOTARIZATION_PASS }}
+        run: |
+          xcrun notarytool store-credentials "notarytool-profile" \
+            --apple-id "$NOTARIZATION_APPLE_ID" \
+            --team-id "$NOTARIZATION_TEAM_ID" \
+            --password "$NOTARIZATION_PASS"
+          xcrun notarytool submit Bandwidther.dmg --keychain-profile "notarytool-profile" --wait
+          xcrun stapler staple Bandwidther.dmg
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: Bandwidther.dmg
+          generate_release_notes: true
+
+  update-homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate cask and push to tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          dmg_url="https://github.com/cdzombak/bandwidther/releases/download/${GITHUB_REF_NAME}/Bandwidther.dmg"
+          sha256=$(curl -fSL "$dmg_url" | shasum -a 256 | awk '{print $1}')
+
+          cat > bandwidther.rb <<CASK
+          cask "bandwidther" do
+            version "$version"
+            sha256 "$sha256"
+
+            url "https://github.com/cdzombak/bandwidther/releases/download/v#{version}/Bandwidther.dmg"
+            name "Bandwidther"
+            desc "Menu bar app for monitoring application bandwidth use"
+            homepage "https://github.com/cdzombak/bandwidther"
+
+            app "Bandwidther.app"
+          end
+          CASK
+
+          # Remove the leading whitespace from heredoc
+          sed -i 's/^          //' bandwidther.rb
+
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/cdzombak/homebrew-oss.git" tap
+          mkdir -p tap/Casks
+          cp bandwidther.rb tap/Casks/bandwidther.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/bandwidther.rb
+          git commit -m "Update bandwidther cask to $version"
+          git push
