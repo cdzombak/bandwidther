@@ -5,7 +5,7 @@ SwiftUI menu bar app for monitoring application bandwidth use.
 > [!NOTE]
 > This app was vibe coded using Claude Opus 4.6 and GPT-5.4. I do not have deep knowledge of macOS networking or SwiftUI such that I can confidently evaluate the end result.
 
-![Screenshot of Bandwidther macOS app showing two columns: left side displays overall download/upload speeds, a bandwidth graph over the last 60 seconds, cumulative totals, internet and LAN connection counts, and internet destinations; right side shows per-process bandwidth usage sorted by rate with processes like nsurlsessiond, apsd, rapportd, mDNSResponder, Dropbox, and others listed with their individual download/upload speeds and progress bars.](https://github.com/simonw/bandwidther/raw/main/screenshot.png)
+![Screenshot of Bandwidther macOS app showing two columns: left side displays overall download/upload speeds, a bandwidth graph over the last 60 seconds, cumulative totals, internet and LAN connection counts, and internet destinations; right side shows per-process bandwidth usage sorted by rate with processes like nsurlsessiond, apsd, rapportd, mDNSResponder, Dropbox, and others listed with their individual download/upload speeds and progress bars.](./screenshot.png)
 
 ## Features
 
@@ -14,6 +14,7 @@ SwiftUI menu bar app for monitoring application bandwidth use.
 - Reverse DNS resolution for remote destinations
 - Sparkline bandwidth graph (last 60 seconds)
 - Two-column popover panel from the menu bar
+- Menu bar icon shows current upload/download bandwidth
 
 ## How measurement works
 
@@ -30,10 +31,18 @@ Important limitations:
 - LAN vs internet classification is heuristic. Private IPv4 ranges, loopback, link-local IPv6, and unique-local IPv6 are treated as local.
 - If `nettop` or `lsof` is unavailable or denied by the system, the app may be unable to collect some measurements. Recent versions of the app surface `nettop` failures in the UI instead of silently showing zero traffic.
 
+## Installing
+
+A prebuilt, codesigned distribution is available through Homebrew:
+
+```
+brew install --cask cdzombak/oss/bandwidther
+```
+
 ## Building
 
 ```bash
-git clone https://github.com/simonw/bandwidther
+git clone https://github.com/cdzombak/bandwidther
 cd bandwidther
 make
 open Bandwidther.app
@@ -42,3 +51,7 @@ open Bandwidther.app
 Requires macOS and Xcode command line tools (`xcode-select --install`).
 
 The `Makefile` compiles the Swift source and packages it into a proper `.app` bundle with `LSUIElement` set so it runs as a menu bar agent (no Dock icon).
+
+## Author
+
+Core software by [@simonw](https://github.com/simonw/bandwidther); minor modifications by [@cdzombak](https://github.com/cdzombak/).
