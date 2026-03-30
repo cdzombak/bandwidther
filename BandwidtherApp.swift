@@ -377,7 +377,7 @@ class NetworkMonitor: ObservableObject {
         let pipe = Pipe()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-        process.arguments = ["-n", "-P", "-iTCP"]
+        process.arguments = ["+c", "0", "-n", "-P", "-iTCP"]
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
 
@@ -396,7 +396,8 @@ class NetworkMonitor: ObservableObject {
             let state = String(stateToken.dropFirst().dropLast())
             guard state == "ESTABLISHED" || state == "SYN_SENT" || state == "CLOSE_WAIT" else { continue }
 
-            let procName = String(cols[0])
+            // lsof +c 0 encodes spaces as \x20 in the COMMAND column
+            let procName = String(cols[0]).replacingOccurrences(of: "\\x20", with: " ")
             guard let connField = cols.dropLast().last(where: { $0.contains("->") }) else { continue }
             guard let remote = parseRemoteEndpoint(from: String(connField)) else { continue }
 
