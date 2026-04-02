@@ -252,12 +252,9 @@ class NetworkMonitor: ObservableObject {
     private var connTimer: Timer?
     private var nettopTimer: Timer?
     private let maxHistory = 60
+    private(set) var isDetailVisible = false
 
     init() {
-        refreshConnections()
-        connTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
-            self?.refreshConnections()
-        }
         refreshNettop()
         nettopTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.refreshNettop()
@@ -267,6 +264,24 @@ class NetworkMonitor: ObservableObject {
     deinit {
         connTimer?.invalidate()
         nettopTimer?.invalidate()
+    }
+
+    /// Call when the popover is shown to start lsof polling
+    func beginDetailPolling() {
+        guard !isDetailVisible else { return }
+        isDetailVisible = true
+        refreshConnections()
+        connTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            self?.refreshConnections()
+        }
+    }
+
+    /// Call when the popover is closed to stop lsof polling
+    func endDetailPolling() {
+        guard isDetailVisible else { return }
+        isDetailVisible = false
+        connTimer?.invalidate()
+        connTimer = nil
     }
 
     func refreshNettop() {
@@ -1060,10 +1075,11 @@ final class MenuBarIconGenerator {
 
 // MARK: - App Delegate for Menu Bar
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var statusItem: NSStatusItem!
     var popover: NSPopover!
     private var rateObservation: AnyCancellable?
+    private var lastMenuBarText: String = ""
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let monitor = NetworkMonitor.shared
@@ -1071,25 +1087,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Create status bar item with variable width for speed text
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
+        let initialText = MenuBarIconGenerator.menuBarText(rate: .zero)
+        lastMenuBarText = initialText
         if let button = statusItem.button {
-            button.image = MenuBarIconGenerator.generateIcon(
-                text: MenuBarIconGenerator.menuBarText(rate: .zero)
-            )
+            button.image = MenuBarIconGenerator.generateIcon(text: initialText)
             button.action = #selector(togglePopover)
             button.target = self
         }
 
-        // Observe rate changes and update the menu bar icon
+        // Observe rate changes and update the menu bar icon only when text changes
         rateObservation = monitor.$currentRate.receive(on: RunLoop.main).sink { [weak self] rate in
-            self?.statusItem.button?.image = MenuBarIconGenerator.generateIcon(
-                text: MenuBarIconGenerator.menuBarText(rate: rate)
-            )
+            guard let self = self else { return }
+            let text = MenuBarIconGenerator.menuBarText(rate: rate)
+            if text != self.lastMenuBarText {
+                self.lastMenuBarText = text
+                self.statusItem.button?.image = MenuBarIconGenerator.generateIcon(text: text)
+            }
         }
 
         // Create the popover with our content
         let popover = NSPopover()
         popover.contentSize = NSSize(width: 900, height: 750)
         popover.behavior = .transient
+        popover.delegate = self
         popover.contentViewController = NSHostingController(rootView: ContentView())
         self.popover = popover
 
@@ -1102,10 +1122,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if popover.isShown {
             popover.performClose(nil)
         } else {
+            NetworkMonitor.shared.beginDetailPolling()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
             popover.contentViewController?.view.window?.makeKey()
         }
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        NetworkMonitor.shared.endDetailPolling()
     }
 }
 
