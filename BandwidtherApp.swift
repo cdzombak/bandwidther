@@ -1222,8 +1222,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         lastMenuBarText = initialText
         if let button = statusItem.button {
             button.image = MenuBarIconGenerator.generateIcon(text: initialText)
-            button.action = #selector(togglePopover)
+            button.action = #selector(statusItemClicked)
             button.target = self
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
         // Observe rate changes and update the menu bar icon only when text changes
@@ -1248,15 +1249,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         NSApp.setActivationPolicy(.accessory)
     }
 
-    @objc func togglePopover() {
-        guard let button = statusItem.button else { return }
-        if popover.isShown {
-            popover.performClose(nil)
+    @objc func statusItemClicked() {
+        guard let event = NSApp.currentEvent, let button = statusItem.button else { return }
+        if event.type == .rightMouseUp {
+            let menu = NSMenu()
+            menu.addItem(NSMenuItem(title: "Quit Bandwidther", action: #selector(NSApplication.terminate(_:)), keyEquivalent: ""))
+            statusItem.menu = menu
+            statusItem.button?.performClick(nil)
+            statusItem.menu = nil
         } else {
-            NetworkMonitor.shared.beginDetailPolling()
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            NSApp.activate(ignoringOtherApps: true)
-            popover.contentViewController?.view.window?.makeKey()
+            if popover.isShown {
+                popover.performClose(nil)
+            } else {
+                NetworkMonitor.shared.beginDetailPolling()
+                popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+                NSApp.activate(ignoringOtherApps: true)
+                popover.contentViewController?.view.window?.makeKey()
+            }
         }
     }
 
