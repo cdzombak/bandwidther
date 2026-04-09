@@ -253,17 +253,49 @@ class NetworkMonitor: ObservableObject {
     private var nettopTimer: Timer?
     private let maxHistory = 60
     private(set) var isDetailVisible = false
+    private var screenSleepObserver: NSObjectProtocol?
+    private var screenWakeObserver: NSObjectProtocol?
+    private var isScreenAsleep = false
 
     init() {
         refreshNettop()
-        nettopTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        nettopTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
             self?.refreshNettop()
+        }
+
+        // Pause polling when the display sleeps to save energy
+        screenSleepObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.handleScreenSleep()
+        }
+        screenWakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.handleScreenWake()
         }
     }
 
     deinit {
         connTimer?.invalidate()
         nettopTimer?.invalidate()
+        if let obs = screenSleepObserver { NSWorkspace.shared.notificationCenter.removeObserver(obs) }
+        if let obs = screenWakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(obs) }
+    }
+
+    private func handleScreenSleep() {
+        isScreenAsleep = true
+        nettopTimer?.invalidate()
+        nettopTimer = nil
+        endDetailPolling()
+    }
+
+    private func handleScreenWake() {
+        isScreenAsleep = false
+        refreshNettop()
+        nettopTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.refreshNettop()
+        }
     }
 
     /// Call when the popover is shown to start lsof polling
