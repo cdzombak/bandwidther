@@ -327,7 +327,7 @@ class LightweightNetMonitor {
 
 class NetworkMonitor: ObservableObject {
     static let shared = NetworkMonitor()
-    @Published var currentRate = BandwidthRate.zero
+    @Published var currentRate: BandwidthRate?
     @Published var totalBytesIn: UInt64 = 0
     @Published var totalBytesOut: UInt64 = 0
     @Published var nettopStatus: String?
@@ -978,13 +978,13 @@ struct ContentView: View {
             HStack(spacing: 10) {
                 RateCardView(
                     title: "DOWNLOAD",
-                    rate: formatBytesRate(monitor.currentRate.bytesInPerSec),
+                    rate: formatBytesRate(monitor.currentRate?.bytesInPerSec ?? 0),
                     icon: "arrow.down.circle.fill",
                     color: .blue
                 )
                 RateCardView(
                     title: "UPLOAD",
-                    rate: formatBytesRate(monitor.currentRate.bytesOutPerSec),
+                    rate: formatBytesRate(monitor.currentRate?.bytesOutPerSec ?? 0),
                     icon: "arrow.up.circle.fill",
                     color: .orange
                 )
@@ -1194,7 +1194,10 @@ final class MenuBarIconGenerator {
         return String(format: "%4.0f   B", bytesPerSec)
     }
 
-    static func menuBarText(rate: BandwidthRate) -> String {
+    static func menuBarText(rate: BandwidthRate?) -> String {
+        guard let rate = rate else {
+            return "  \u{2014}    B/s ↑\n  \u{2014}    B/s ↓"
+        }
         let up = formatCompactRate(rate.bytesOutPerSec)
         let down = formatCompactRate(rate.bytesInPerSec)
         return "\(up)/s ↑\n\(down)/s ↓"
@@ -1215,7 +1218,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // Create status bar item with variable width for speed text
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
-        let initialText = MenuBarIconGenerator.menuBarText(rate: .zero)
+        let initialText = MenuBarIconGenerator.menuBarText(rate: nil)
         lastMenuBarText = initialText
         if let button = statusItem.button {
             button.image = MenuBarIconGenerator.generateIcon(text: initialText)
