@@ -797,7 +797,7 @@ struct SortButton: View {
                 ascending.toggle()
             } else {
                 currentKey = key
-                ascending = key == .name ? false : false
+                ascending = key == .name
             }
             action()
         }) {
