@@ -234,6 +234,95 @@ func runNettop() -> NettopResult {
     return result
 }
 
+// MARK: - Lightweight Network Rate Monitor (getifaddrs)
+
+/// Reads aggregate network byte counters via getifaddrs() and computes rates
+/// from deltas between consecutive calls. No subprocess needed — just a fast
+/// syscall. Used for menu bar updates when the popover is closed.
+class LightweightNetMonitor {
+    private var lastReadTime: CFAbsoluteTime = 0
+    private var lastCounters: [String: (bytesIn: UInt64, bytesOut: UInt64)] = [:]
+    private var hasBaseline = false
+
+    /// Read current rates by computing deltas from last call.
+    /// First call establishes baseline and returns .zero.
+    func readRate() -> BandwidthRate {
+        let counters = readInterfaceCounters()
+        let now = CFAbsoluteTimeGetCurrent()
+
+        guard hasBaseline else {
+            lastCounters = counters
+            lastReadTime = now
+            hasBaseline = true
+            return .zero
+        }
+
+        let elapsed = now - lastReadTime
+        guard elapsed > 0.01 else { return .zero }
+
+        var totalDeltaIn: UInt64 = 0
+        var totalDeltaOut: UInt64 = 0
+
+        for (name, current) in counters {
+            guard let last = lastCounters[name] else { continue }
+            // Handle per-interface uint32 counter wrap
+            if current.bytesIn >= last.bytesIn {
+                totalDeltaIn += current.bytesIn - last.bytesIn
+            } else {
+                totalDeltaIn += current.bytesIn + (UInt64(UInt32.max) + 1) - last.bytesIn
+            }
+            if current.bytesOut >= last.bytesOut {
+                totalDeltaOut += current.bytesOut - last.bytesOut
+            } else {
+                totalDeltaOut += current.bytesOut + (UInt64(UInt32.max) + 1) - last.bytesOut
+            }
+        }
+
+        lastCounters = counters
+        lastReadTime = now
+
+        // After long gaps (e.g. screen sleep), report zero rather than a spike
+        if elapsed > 60.0 { return .zero }
+
+        return BandwidthRate(
+            bytesInPerSec: Double(totalDeltaIn) / elapsed,
+            bytesOutPerSec: Double(totalDeltaOut) / elapsed
+        )
+    }
+
+    /// Reset state so the next readRate() establishes a fresh baseline.
+    func reset() {
+        hasBaseline = false
+        lastCounters = [:]
+    }
+
+    private func readInterfaceCounters() -> [String: (bytesIn: UInt64, bytesOut: UInt64)] {
+        var ifaddrsPtr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddrsPtr) == 0, let firstAddr = ifaddrsPtr else { return [:] }
+        defer { freeifaddrs(ifaddrsPtr) }
+
+        var result: [String: (bytesIn: UInt64, bytesOut: UInt64)] = [:]
+        var current: UnsafeMutablePointer<ifaddrs>? = firstAddr
+
+        while let addr = current {
+            defer { current = addr.pointee.ifa_next }
+
+            let flags = Int32(addr.pointee.ifa_flags)
+            guard (flags & IFF_LOOPBACK) == 0 else { continue }
+            guard (flags & IFF_UP) != 0 else { continue }
+            guard let sa = addr.pointee.ifa_addr, sa.pointee.sa_family == UInt8(AF_LINK) else { continue }
+            guard let data = addr.pointee.ifa_data else { continue }
+
+            let ifData = data.assumingMemoryBound(to: if_data.self).pointee
+            let name = String(cString: addr.pointee.ifa_name)
+
+            result[name] = (bytesIn: UInt64(ifData.ifi_ibytes), bytesOut: UInt64(ifData.ifi_obytes))
+        }
+
+        return result
+    }
+}
+
 // MARK: - Network Monitor
 
 class NetworkMonitor: ObservableObject {
@@ -251,18 +340,22 @@ class NetworkMonitor: ObservableObject {
 
     private var connTimer: Timer?
     private var nettopTimer: Timer?
+    private var lightTimer: Timer?
+    private let lightMonitor = LightweightNetMonitor()
     private let maxHistory = 60
     private(set) var isDetailVisible = false
     private var screenSleepObserver: NSObjectProtocol?
     private var screenWakeObserver: NSObjectProtocol?
     private var isScreenAsleep = false
 
-    private static let nettopBackgroundInterval: TimeInterval = 5.0
-    private static let nettopForegroundInterval: TimeInterval = 2.0
+    private static let nettopPollInterval: TimeInterval = 2.0
+    private static let lightweightPollInterval: TimeInterval = 5.0
 
     init() {
-        refreshNettop()
-        scheduleNettopTimer()
+        // Establish baseline for lightweight monitor; menu bar updates
+        // will start arriving after the first lightweight timer fire.
+        _ = lightMonitor.readRate()
+        scheduleLightweightTimer()
 
         // Pause polling when the display sleeps to save energy
         screenSleepObserver = NSWorkspace.shared.notificationCenter.addObserver(
@@ -280,15 +373,31 @@ class NetworkMonitor: ObservableObject {
     deinit {
         connTimer?.invalidate()
         nettopTimer?.invalidate()
+        lightTimer?.invalidate()
         if let obs = screenSleepObserver { NSWorkspace.shared.notificationCenter.removeObserver(obs) }
         if let obs = screenWakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(obs) }
     }
 
     private func scheduleNettopTimer() {
         nettopTimer?.invalidate()
-        let interval = isDetailVisible ? Self.nettopForegroundInterval : Self.nettopBackgroundInterval
-        nettopTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+        nettopTimer = Timer.scheduledTimer(withTimeInterval: Self.nettopPollInterval, repeats: true) { [weak self] _ in
             self?.refreshNettop()
+        }
+    }
+
+    private func scheduleLightweightTimer() {
+        lightTimer?.invalidate()
+        lightTimer = Timer.scheduledTimer(withTimeInterval: Self.lightweightPollInterval, repeats: true) { [weak self] _ in
+            self?.refreshLightweight()
+        }
+    }
+
+    private func refreshLightweight() {
+        let rate = lightMonitor.readRate()
+        currentRate = rate
+        rateHistory.append(rate)
+        if rateHistory.count > maxHistory {
+            rateHistory.removeFirst()
         }
     }
 
@@ -296,33 +405,55 @@ class NetworkMonitor: ObservableObject {
         isScreenAsleep = true
         nettopTimer?.invalidate()
         nettopTimer = nil
-        endDetailPolling()
+        lightTimer?.invalidate()
+        lightTimer = nil
+        connTimer?.invalidate()
+        connTimer = nil
+        lightMonitor.reset()
     }
 
     private func handleScreenWake() {
         isScreenAsleep = false
-        refreshNettop()
-        scheduleNettopTimer()
+        if isDetailVisible {
+            refreshNettop()
+            scheduleNettopTimer()
+            refreshConnections()
+            connTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+                self?.refreshConnections()
+            }
+        } else {
+            _ = lightMonitor.readRate()
+            scheduleLightweightTimer()
+        }
     }
 
-    /// Call when the popover is shown to start lsof polling
+    /// Call when the popover is shown to switch to nettop + lsof polling
     func beginDetailPolling() {
         guard !isDetailVisible else { return }
         isDetailVisible = true
+        lightTimer?.invalidate()
+        lightTimer = nil
+        guard !isScreenAsleep else { return }
+        refreshNettop()
+        scheduleNettopTimer()
         refreshConnections()
         connTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             self?.refreshConnections()
         }
-        scheduleNettopTimer()
     }
 
-    /// Call when the popover is closed to stop lsof polling
+    /// Call when the popover is closed to switch to lightweight polling
     func endDetailPolling() {
         guard isDetailVisible else { return }
         isDetailVisible = false
         connTimer?.invalidate()
         connTimer = nil
-        scheduleNettopTimer()
+        nettopTimer?.invalidate()
+        nettopTimer = nil
+        guard !isScreenAsleep else { return }
+        lightMonitor.reset()
+        _ = lightMonitor.readRate()
+        scheduleLightweightTimer()
     }
 
     func refreshNettop() {
