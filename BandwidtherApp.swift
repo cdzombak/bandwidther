@@ -341,6 +341,7 @@ class NetworkMonitor: ObservableObject {
     private var connTimer: Timer?
     private var nettopTimer: Timer?
     private var lightTimer: Timer?
+    private var dnsCacheSubscription: AnyCancellable?
     private let lightMonitor = LightweightNetMonitor()
     private let maxHistory = 60
     private(set) var isDetailVisible = false
@@ -352,6 +353,12 @@ class NetworkMonitor: ObservableObject {
     private static let lightweightPollInterval: TimeInterval = 5.0
 
     init() {
+        // Forward dnsCache changes so SwiftUI views observing NetworkMonitor
+        // re-render when DNS resolutions complete.
+        dnsCacheSubscription = dnsCache.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+
         // Establish baseline for lightweight monitor; menu bar updates
         // will start arriving after the first lightweight timer fire.
         _ = lightMonitor.readRate()
