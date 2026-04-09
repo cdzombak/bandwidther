@@ -179,7 +179,7 @@ private func parseNettopCSVBlock(_ lines: [String]) -> [String: NettopProcessDat
     return result
 }
 
-func runNettop() -> NettopResult {
+private func runNettop() -> NettopResult {
     let pipe = Pipe()
     let errorPipe = Pipe()
     let proc = Process()
