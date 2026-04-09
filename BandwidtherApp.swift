@@ -257,11 +257,12 @@ class NetworkMonitor: ObservableObject {
     private var screenWakeObserver: NSObjectProtocol?
     private var isScreenAsleep = false
 
+    private static let nettopBackgroundInterval: TimeInterval = 5.0
+    private static let nettopForegroundInterval: TimeInterval = 2.0
+
     init() {
         refreshNettop()
-        nettopTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            self?.refreshNettop()
-        }
+        scheduleNettopTimer()
 
         // Pause polling when the display sleeps to save energy
         screenSleepObserver = NSWorkspace.shared.notificationCenter.addObserver(
@@ -283,6 +284,14 @@ class NetworkMonitor: ObservableObject {
         if let obs = screenWakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(obs) }
     }
 
+    private func scheduleNettopTimer() {
+        nettopTimer?.invalidate()
+        let interval = isDetailVisible ? Self.nettopForegroundInterval : Self.nettopBackgroundInterval
+        nettopTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.refreshNettop()
+        }
+    }
+
     private func handleScreenSleep() {
         isScreenAsleep = true
         nettopTimer?.invalidate()
@@ -293,9 +302,7 @@ class NetworkMonitor: ObservableObject {
     private func handleScreenWake() {
         isScreenAsleep = false
         refreshNettop()
-        nettopTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            self?.refreshNettop()
-        }
+        scheduleNettopTimer()
     }
 
     /// Call when the popover is shown to start lsof polling
@@ -306,6 +313,7 @@ class NetworkMonitor: ObservableObject {
         connTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             self?.refreshConnections()
         }
+        scheduleNettopTimer()
     }
 
     /// Call when the popover is closed to stop lsof polling
@@ -314,6 +322,7 @@ class NetworkMonitor: ObservableObject {
         isDetailVisible = false
         connTimer?.invalidate()
         connTimer = nil
+        scheduleNettopTimer()
     }
 
     func refreshNettop() {
