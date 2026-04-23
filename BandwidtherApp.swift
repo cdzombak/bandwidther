@@ -355,6 +355,7 @@ class NetworkMonitor: ObservableObject {
     private static let connectionPollTolerance: TimeInterval = 0.75
     private static let lightweightPollInterval: TimeInterval = 5.0
     private static let lightweightPollTolerance: TimeInterval = 1.0
+    private static let maxVisibleInternetDestinations: Int = 20
 
     init() {
         // Forward dnsCache changes so SwiftUI views observing NetworkMonitor
@@ -564,15 +565,19 @@ class NetworkMonitor: ObservableObject {
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.connectionSummary = summary
-                // Trigger async DNS resolution for all unique IPs
-                let allDests = summary.internetDestinations + summary.lanDestinations
-                for dest in allDests {
+                // Resolve only the internet destinations currently rendered in the UI.
+                for dest in self.visibleInternetDestinations(from: summary) {
                     if let endpoint = self.parseDestinationString(dest) {
                         self.dnsCache.resolve(endpoint.host)
                     }
                 }
             }
         }
+    }
+
+    func visibleInternetDestinations(from summary: ConnectionSummary) -> [String] {
+        let sorted = Array(Set(summary.internetDestinations)).sorted()
+        return Array(sorted.prefix(Self.maxVisibleInternetDestinations))
     }
 
     private func parseConnections() -> ConnectionSummary {
@@ -1107,14 +1112,14 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 6) {
                 SectionHeader(title: "Internet Destinations", icon: "mappin.and.ellipse")
 
-                let dests = Array(Set(monitor.connectionSummary.internetDestinations)).sorted().prefix(20)
+                let dests = monitor.visibleInternetDestinations(from: monitor.connectionSummary)
                 if dests.isEmpty {
                     Text("None")
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
                 } else {
                     LazyVStack(alignment: .leading, spacing: 4) {
-                        ForEach(Array(dests), id: \.self) { dest in
+                        ForEach(dests, id: \.self) { dest in
                             if let endpoint = monitor.parseDestinationString(dest) {
                                 let hostname = monitor.dnsCache.hostname(for: endpoint.host)
                                 VStack(alignment: .leading, spacing: 1) {
