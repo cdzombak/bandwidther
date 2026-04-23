@@ -350,7 +350,11 @@ class NetworkMonitor: ObservableObject {
     private var isScreenAsleep = false
 
     private static let nettopPollInterval: TimeInterval = 2.0
+    private static let nettopPollTolerance: TimeInterval = 0.5
+    private static let connectionPollInterval: TimeInterval = 3.0
+    private static let connectionPollTolerance: TimeInterval = 0.75
     private static let lightweightPollInterval: TimeInterval = 5.0
+    private static let lightweightPollTolerance: TimeInterval = 1.0
 
     init() {
         // Forward dnsCache changes so SwiftUI views observing NetworkMonitor
@@ -390,6 +394,15 @@ class NetworkMonitor: ObservableObject {
         nettopTimer = Timer.scheduledTimer(withTimeInterval: Self.nettopPollInterval, repeats: true) { [weak self] _ in
             self?.refreshNettop()
         }
+        nettopTimer?.tolerance = Self.nettopPollTolerance
+    }
+
+    private func scheduleConnectionTimer() {
+        connTimer?.invalidate()
+        connTimer = Timer.scheduledTimer(withTimeInterval: Self.connectionPollInterval, repeats: true) { [weak self] _ in
+            self?.refreshConnections()
+        }
+        connTimer?.tolerance = Self.connectionPollTolerance
     }
 
     private func scheduleLightweightTimer() {
@@ -397,6 +410,7 @@ class NetworkMonitor: ObservableObject {
         lightTimer = Timer.scheduledTimer(withTimeInterval: Self.lightweightPollInterval, repeats: true) { [weak self] _ in
             self?.refreshLightweight()
         }
+        lightTimer?.tolerance = Self.lightweightPollTolerance
     }
 
     private func refreshLightweight() {
@@ -425,9 +439,7 @@ class NetworkMonitor: ObservableObject {
             refreshNettop()
             scheduleNettopTimer()
             refreshConnections()
-            connTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
-                self?.refreshConnections()
-            }
+            scheduleConnectionTimer()
         } else {
             _ = lightMonitor.readRate()
             scheduleLightweightTimer()
@@ -444,9 +456,7 @@ class NetworkMonitor: ObservableObject {
         refreshNettop()
         scheduleNettopTimer()
         refreshConnections()
-        connTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
-            self?.refreshConnections()
-        }
+        scheduleConnectionTimer()
     }
 
     /// Call when the popover is closed to switch to lightweight polling
